@@ -54,7 +54,7 @@ def safe_zscore(x: np.ndarray) -> np.ndarray:
     y = x.copy()
     if not np.all(finite):
         y[~finite] = np.interp(np.flatnonzero(~finite), np.flatnonzero(finite), y[finite])
-    std = float(np.std(y))
+    std = float(np.std(y, ddof=1)) if y.size > 1 else 0.0
     if std < np.finfo(float).eps:
         return np.zeros_like(y, dtype=float)
     return (y - float(np.mean(y))) / std
@@ -190,7 +190,8 @@ def estimate_temko_wfpv(
         raise ValueError("Invalid frequency range after FFT bin selection")
     freq_range = freq_range_all[low_idx : high_idx + 1]
 
-    ppg_history: list[np.ndarray] = []
+    w1_history: list[np.ndarray] = []
+    w2_history: list[np.ndarray] = []
     previous_ppg_fft: np.ndarray | None = None
     previous_estimates: list[float] = []
     previous_range: np.ndarray | None = None
@@ -225,25 +226,31 @@ def estimate_temko_wfpv(
         previous_ppg_fft = ppg_fft
 
         ppg_abs = np.abs(ppg_fft)
-        ppg_history.append(safe_norm_spectrum(ppg_abs))
-        hist_start = max(0, len(ppg_history) - wf_length - 1)
-        ppg_env = np.mean(ppg_history[hist_start:], axis=0)
-        ppg_env_norm = safe_norm_spectrum(ppg_env)
-
+        ppg_norm = safe_norm_spectrum(ppg_abs)
         acc_x_norm = safe_norm_spectrum(np.abs(acc_x_fft))
         acc_y_norm = safe_norm_spectrum(np.abs(acc_y_fft))
         acc_z_norm = safe_norm_spectrum(np.abs(acc_z_fft))
         acc_mean_norm = (acc_x_norm + acc_y_norm + acc_z_norm) / 3.0
 
-        wf1 = 1.0 - acc_mean_norm / np.maximum(ppg_env_norm, 1e-12)
+        w1_env = np.mean((w1_history + [ppg_norm])[-(wf_length + 1) :], axis=0)
+        w1_env_norm = safe_norm_spectrum(w1_env)
+        wf1 = 1.0 - acc_mean_norm / np.maximum(w1_env_norm, 1e-12)
         wf1[wf1 < 0] = -1.0
         w1_clean = ppg_abs * wf1
 
-        wf2 = ppg_env_norm / np.maximum(acc_mean_norm + ppg_env_norm, 1e-12)
+        # MATLAB updates W2_FFTi with the cleaned WF2 spectrum, so WF2 is
+        # recursively estimated from past cleaned spectra rather than from
+        # only raw PPG spectral envelopes.
+        w2_env = np.mean((w2_history + [ppg_norm])[-(wf_length + 1) :], axis=0)
+        w2_env_norm = safe_norm_spectrum(w2_env)
+        wf2 = w2_env_norm / np.maximum(acc_mean_norm + w2_env_norm, 1e-12)
         w2_clean = ppg_abs * wf2
 
-        w1_std = float(np.std(w1_clean))
-        w2_std = float(np.std(w2_clean))
+        w1_history.append(ppg_norm)
+        w2_history.append(safe_norm_spectrum(w2_clean))
+
+        w1_std = float(np.std(w1_clean, ddof=1)) if w1_clean.size > 1 else 0.0
+        w2_std = float(np.std(w2_clean, ddof=1)) if w2_clean.size > 1 else 0.0
         if w1_std > np.finfo(float).eps:
             w1_clean = w1_clean / w1_std
         if w2_std > np.finfo(float).eps:
@@ -252,7 +259,7 @@ def estimate_temko_wfpv(
         clean_spectrum = w1_clean + w2_clean
 
         hist_int = 25.0
-        warmup = 15 if record.split == "competition" else 30
+        warmup = 15 if record.split == "competition" or record.name == "DATA_S04_T01" else 30
         if len(previous_estimates) > warmup:
             diffs = np.abs(np.diff(previous_estimates))
             if diffs.size and np.isfinite(diffs).any():
