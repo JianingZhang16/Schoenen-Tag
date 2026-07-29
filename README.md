@@ -9,6 +9,6 @@ In "temko_wfpv_database_analysis.py" and "temko_wfpv_database_analysis.py", I re
 The "PPG denoising.ipynb" file contains the processing results after calling all the scripts mentioned above.
 
 My work involved converting his original Matlab code to Python and reproducing his work on the public dataset provided by Alessandra Galli: 
-> https://github.com/skyxuan7/PPG/commitsauthor=AlessandraGalli.
+> https://github.com/skyxuan7/PPG/commits/author=AlessandraGalli.
 
 Since the original dataset contains 23 records, while the referenced dataset only has 22, the experimental data will differ from the original author's data.
