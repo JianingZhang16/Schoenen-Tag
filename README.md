@@ -9,7 +9,7 @@ In [Temko's on-line version](temko_wfpv_database_analysis.py) and [Temko's offli
 > "[Estimation of heart rate from photoplethysmography during physical exercise using wiener filtering and the phase vocoder](https://doi.org/10.1109/EMBC.2015.7318655)," EMBC 2015 , and
 > "[PPG-Based Heart Rate Estimation Using Wiener Filter, Phase Vocoder and Viterbi Decoding](https://doi.org/10.1109/ICASSP.2017.7952309)," ICASSP 2017, to reproduce his work. The purpose is to use this as a standard method for comparison with the previous two methods.
 
-The [results](PPGdenoising.ipynb) file contains the processing results after calling all the scripts mentioned above.
+The [results](PPG_denoising.ipynb) file contains the processing results after calling all the scripts mentioned above.
 
 My work involved converting his original Matlab code to Python and reproducing his work on the public dataset provided by Alessandra Galli: 
 > [Database](https://github.com/skyxuan7/PPG)
