@@ -3,10 +3,11 @@
 
 This script follows the online MATLAB implementation in andtem2000/PPG
 (`PPG_WFPV_TBME2017.m`) for records stored as MATLAB `.mat` files:
-
-    two-channel PPG averaging -> PPG/ACC band-pass filtering -> downsample to 25 Hz
-    -> Wiener spectral weighting -> phase-vocoder frequency refinement
-    -> history-constrained HR tracking -> BPM0 error analysis.
+For each analysis window, the two PPG channels and three acceleration channels
+are band-pass filtered. The PPG channels are standardised and averaged, after
+which all signals are downsampled to 25 Hz. The method then applies
+accelerometer-informed Wiener spectral weighting, phase-vocoder frequency 
+refinement, and history-based heart-rate tracking.
 
 Training records have shape 6 x N:
     ECG, PPG1, PPG2, ACC_X, ACC_Y, ACC_Z.
@@ -59,6 +60,9 @@ def safe_zscore(x: np.ndarray) -> np.ndarray:
         return np.zeros_like(y, dtype=float)
     return (y - float(np.mean(y))) / std
 
+"""Normalise a spectrum by its maximum absolute value. 
+This places the PPG and acceleration spectra on comparable scales 
+before Wiener spectral weighting."""
 
 def safe_norm_spectrum(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     x = np.asarray(x, dtype=float)
@@ -68,21 +72,42 @@ def safe_norm_spectrum(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return x / scale
 
 
-def moving_average_same(x: np.ndarray, width: int) -> np.ndarray:
+def matlab_moving_vector(x: np.ndarray, width: int) -> np.ndarray:
+    """Reproduce the boundary handling of Temko's MATLAB moving.m function.
+    In this script, it is used to smooth the phase-vocoder frequency estimates across three neighbouring frequency bins.
+    """
     x = np.asarray(x, dtype=float)
     if width <= 1 or x.size == 0:
         return x.copy()
-    kernel = np.ones(width, dtype=float) / width
-    pad_left = width // 2
-    pad_right = width - 1 - pad_left
-    padded = np.pad(x, (pad_left, pad_right), mode="edge")
-    return np.convolve(padded, kernel, mode="valid")
+    if width > x.size:
+        raise ValueError("moving-average width must not exceed the input length")
 
+    kernel = np.ones(width, dtype=float) / width
+    causal = signal.lfilter(kernel, [1.0], x)
+    half_width = width // 2
+    is_odd = width % 2
+    first_complete = width - 1
+    indices = np.concatenate(
+        [
+            np.full(half_width - 1 + is_odd, first_complete, dtype=int),
+            np.arange(first_complete, x.size, dtype=int),
+            np.full(half_width, x.size - 1, dtype=int),
+        ]
+    )
+    return causal[indices]
+
+"""Apply the same fourth-order Butterworth band-pass filter as in Temko's MATLAB implementation. 
+The passband from 0.4 to 4.0 Hz retains the main cardiac and motion-related frequency components used in the later analysis.
+"""
 
 def bandpass_lfilter(x: np.ndarray, fs: float, low_hz: float = 0.4, high_hz: float = 4.0) -> np.ndarray:
     b, a = signal.butter(4, [low_hz, high_hz], btype="bandpass", fs=fs)
     return signal.lfilter(b, a, np.asarray(x, dtype=float))
 
+"""Refine the FFT-bin frequencies using the phase difference between the current and previous PPG windows. 
+Among several possible phase-unwrapped frequencies,the candidate closest to the original FFT-bin frequency is selected.
+Smooth the refined frequency grid over neighbouring frequency bins 
+using the same three-point moving operation as in the MATLAB implementation."""
 
 def phase_vocoder_frequencies(
     current_fft: np.ndarray,
@@ -92,13 +117,16 @@ def phase_vocoder_frequencies(
     smooth_bins: int,
 ) -> np.ndarray:
     refined = bin_freqs.astype(float).copy()
+    """Phase refinement starts from the second window because the previous PPG spectrum is required."""
     if previous_fft is not None and len(previous_fft) == len(current_fft):
         wraps = np.arange(20, dtype=float)
         for idx, bin_freq in enumerate(bin_freqs):
             phase_delta = np.angle(current_fft[idx]) - np.angle(previous_fft[idx])
             candidates = (phase_delta + 2.0 * np.pi * wraps) / (2.0 * np.pi * hop_s)
             refined[idx] = candidates[int(np.argmin(np.abs(candidates - bin_freq)))]
-    return moving_average_same(refined, smooth_bins)
+
+            """Smooth the refined frequency grid over neighbouring frequency bins."""
+    return matlab_moving_vector(refined, smooth_bins)
 
 
 def strongest_within_range(spectrum: np.ndarray, allowed_idx: np.ndarray) -> int:
@@ -148,6 +176,8 @@ def load_record(record: DatabaseRecord) -> tuple[np.ndarray, np.ndarray]:
     bpm0 = np.asarray(truth["BPM0"], dtype=float).reshape(-1)
     return sig, bpm0
 
+"""Extract the two PPG channels and the three acceleration channels 
+according to the channel arrangement of the training or competition subset."""
 
 def extract_channels(record: DatabaseRecord, sig: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if sig.ndim != 2:
@@ -162,7 +192,9 @@ def extract_channels(record: DatabaseRecord, sig: np.ndarray) -> tuple[np.ndarra
         ch1, ch2, ch3, ch4, ch5 = 1, 2, 3, 4, 5
     return sig[ch1], sig[ch2], sig[ch3], sig[ch4], sig[ch5]
 
-
+"""Apply the complete online WFPV pipeline to one recording. Each window is
+processed using only the current and previous information, without access to
+future windows."""
 def estimate_temko_wfpv(
     record: DatabaseRecord,
     sig: np.ndarray,
@@ -177,11 +209,17 @@ def estimate_temko_wfpv(
     smooth_freq_bins: int,
 ) -> pd.DataFrame:
     ppg1, ppg2, acc_x, acc_y, acc_z = extract_channels(record, sig)
+    """Divide the recording into 8 s analysis windows with a 2 s step. The number of
+    processed windows is limited by the available BPM0 reference values."""
     window = int(round(window_sec * fs))
     step = int(round(step_sec * fs))
     window_nb = int(np.floor((sig.shape[1] - window) / step) + 1)
     window_nb = min(window_nb, len(bpm0))
+    """Downsampling by a factor of five reduces the sampling rate from 125 to 25 Hz."""
     target_fs = fs / 5.0
+
+    """Construct the frequency grid used in Temko's implementation and retain the
+    HR search interval from 1 to 3 Hz, corresponding approximately to 60--180 BPM."""
 
     freq_range_all = np.linspace(0.0, target_fs, fft_res)
     low_idx = int(np.argmin(np.abs(freq_range_all - search_low_hz)))
@@ -190,6 +228,10 @@ def estimate_temko_wfpv(
         raise ValueError("Invalid frequency range after FFT bin selection")
     freq_range = freq_range_all[low_idx : high_idx + 1]
 
+    """Store the recent spectral envelopes required by the two Wiener filters, 
+    the previous PPG spectrum required by the phase vocoder, and the previous HR
+    estimates required by online tracking."""
+
     w1_history: list[np.ndarray] = []
     w2_history: list[np.ndarray] = []
     previous_ppg_fft: np.ndarray | None = None
@@ -197,24 +239,40 @@ def estimate_temko_wfpv(
     previous_range: np.ndarray | None = None
     rows: list[dict[str, float | int | str]] = []
 
+    """Process the recording window by window without using future observations."""
+
     for i in range(window_nb):
         cur = slice(i * step, i * step + window)
+        """Band-pass filter the two PPG channels and the three acceleration channels
+       separately within the current analysis window. """
         cur_ppg1 = bandpass_lfilter(ppg1[cur], fs)
         cur_ppg2 = bandpass_lfilter(ppg2[cur], fs)
         cur_acc_x = bandpass_lfilter(acc_x[cur], fs)
         cur_acc_y = bandpass_lfilter(acc_y[cur], fs)
         cur_acc_z = bandpass_lfilter(acc_z[cur], fs)
 
+        """Standardise the two PPG channels separately and combine them using
+        equal-weight averaging. The acceleration channels are not standardised in
+        the time domain."""
+
         ppg_average = 0.5 * safe_zscore(cur_ppg1) + 0.5 * safe_zscore(cur_ppg2)
+
+        """Downsample the fused PPG signal and all three acceleration channels from
+        125 Hz to 25 Hz."""
         ppg_average = ppg_average[::5]
         cur_acc_x = cur_acc_x[::5]
         cur_acc_y = cur_acc_y[::5]
         cur_acc_z = cur_acc_z[::5]
 
+        """Compute a 1024-point DFT for the fused PPG signal and each acceleration axis.
+        Only the spectral bins inside the selected HR range are retained.
+        """
         ppg_fft = np.fft.fft(ppg_average, fft_res)[low_idx : high_idx + 1]
         acc_x_fft = np.fft.fft(cur_acc_x, fft_res)[low_idx : high_idx + 1]
         acc_y_fft = np.fft.fft(cur_acc_y, fft_res)[low_idx : high_idx + 1]
         acc_z_fft = np.fft.fft(cur_acc_z, fft_res)[low_idx : high_idx + 1]
+        """Refine the PPG frequency grid using the inter-window phase difference between
+        the current and previous PPG spectra."""
 
         freq_range_ppg = phase_vocoder_frequencies(
             ppg_fft,
@@ -223,19 +281,33 @@ def estimate_temko_wfpv(
             hop_s=step_sec,
             smooth_bins=smooth_freq_bins,
         )
+        """Store the current PPG spectrum for phase refinement in the next window."""
         previous_ppg_fft = ppg_fft
+        """Convert the PPG and acceleration spectra to magnitude spectra and normalise
+        each spectrum separately.
+        """
 
         ppg_abs = np.abs(ppg_fft)
         ppg_norm = safe_norm_spectrum(ppg_abs)
         acc_x_norm = safe_norm_spectrum(np.abs(acc_x_fft))
         acc_y_norm = safe_norm_spectrum(np.abs(acc_y_fft))
         acc_z_norm = safe_norm_spectrum(np.abs(acc_z_fft))
+        """Average the three normalised acceleration spectra to obtain a common estimate
+        of the motion-related spectral contribution.
+        """
         acc_mean_norm = (acc_x_norm + acc_y_norm + acc_z_norm) / 3.0
+        """Wiener filter 1 estimates the recent PPG spectral envelope from the current
+        and previous windows.
+        """
 
         w1_env = np.mean((w1_history + [ppg_norm])[-(wf_length + 1) :], axis=0)
         w1_env_norm = safe_norm_spectrum(w1_env)
+        """Construct the first Wiener-type spectral weight by comparing the PPG envelope
+        with the ACC-derived motion spectrum.
+        """
         wf1 = 1.0 - acc_mean_norm / np.maximum(w1_env_norm, 1e-12)
         wf1[wf1 < 0] = -1.0
+        """Apply the first spectral weight to attenuate motion-related PPG components."""
         w1_clean = ppg_abs * wf1
 
         # MATLAB updates W2_FFTi with the cleaned WF2 spectrum, so WF2 is
@@ -243,11 +315,20 @@ def estimate_temko_wfpv(
         # only raw PPG spectral envelopes.
         w2_env = np.mean((w2_history + [ppg_norm])[-(wf_length + 1) :], axis=0)
         w2_env_norm = safe_norm_spectrum(w2_env)
+        """Construct the second Wiener-type spectral weight from the estimated clean
+        PPG envelope and the ACC-derived motion spectrum."""
         wf2 = w2_env_norm / np.maximum(acc_mean_norm + w2_env_norm, 1e-12)
         w2_clean = ppg_abs * wf2
 
+        """Update the spectral histories. WF1 stores the original normalised PPG
+        spectrum, whereas WF2 stores the cleaned and normalised WF2 spectrum.
+        """
+
         w1_history.append(ppg_norm)
         w2_history.append(safe_norm_spectrum(w2_clean))
+        """Scale the two cleaned spectra by their sample standard deviations so that
+        neither Wiener output dominates the combination only because of its scale.
+        """
 
         w1_std = float(np.std(w1_clean, ddof=1)) if w1_clean.size > 1 else 0.0
         w2_std = float(np.std(w2_clean, ddof=1)) if w2_clean.size > 1 else 0.0
@@ -256,14 +337,30 @@ def estimate_temko_wfpv(
         if w2_std > np.finfo(float).eps:
             w2_clean = w2_clean / w2_std
 
+            """Combine the two cleaned spectra. The resulting spectrum is used for online
+            spectral-peak selection."""
+
         clean_spectrum = w1_clean + w2_clean
+        """
+        Initialise the HR tracking interval to +/-25 BPM. After the warm-up period,
+        adapt the interval from the largest previously observed HR change, with an
+        additional 5 BPM margin.
+        """
 
         hist_int = 25.0
+        """Use a 15-window warm-up for competition records and DATA_S04_T01, and a
+        30-window warm-up for the remaining training records, following Temko's code.
+        """
         warmup = 15 if record.split == "competition" or record.name == "DATA_S04_T01" else 30
-        if len(previous_estimates) > warmup:
+        if len(previous_estimates) >= warmup:
             diffs = np.abs(np.diff(previous_estimates))
             if diffs.size and np.isfinite(diffs).any():
                 hist_int = float(np.nanmax(diffs) + 5.0)
+
+                """Select the strongest peak over the complete HR range for the first window.
+                Later windows restrict the search to the interval defined by previous HR estimates.
+
+                """
 
         if previous_range is None or previous_range.size == 0:
             peak_idx = int(np.nanargmax(clean_spectrum))
@@ -271,7 +368,14 @@ def estimate_temko_wfpv(
             peak_idx = strongest_within_range(clean_spectrum, previous_range)
 
         peak_idx = max(0, min(peak_idx, len(freq_range) - 1))
+        """Convert the phase-vocoder-refined frequency at the selected spectral index
+        from hertz to beats per minute.
+        """
         hr_est = float(freq_range_ppg[peak_idx] * 60.0)
+        """If the new estimate differs from the previous estimate by more than 5 BPM,
+        combine it with a linear-regression prediction based on the five preceding
+        HR estimates. The spectral estimate retains a weight of 0.8.
+        """
 
         if len(previous_estimates) >= 5 and abs(hr_est - previous_estimates[-1]) > 5.0:
             prev = np.asarray(previous_estimates[-5:], dtype=float)
@@ -279,6 +383,10 @@ def estimate_temko_wfpv(
             slope, intercept = np.polyfit(x, prev, 1)
             predicted = float(slope * (len(prev) + 1) + intercept)
             hr_est = 0.8 * hr_est + 0.2 * predicted
+
+            """Store the current HR estimate and apply Temko's small trend-based correction
+            according to the direction of the recent HR changes.
+            """
 
         previous_estimates.append(hr_est)
         if len(previous_estimates) >= 2:
@@ -288,11 +396,17 @@ def estimate_temko_wfpv(
                 hr_est = hr_est + float(np.sum(np.sign(recent - older)) * 0.1)
                 previous_estimates[-1] = hr_est
 
+                """Convert the adaptive tracking interval from BPM to spectral-bin indices and
+                define the restricted search range for the next window.
+                """
+
         df_bpm = float(np.median(np.diff(freq_range)) * 60.0)
         half_width = int(round(hist_int / max(df_bpm, 1e-12)))
         previous_range = np.arange(max(0, peak_idx - half_width), min(len(freq_range), peak_idx + half_width + 1))
 
         start_s = i * step_sec
+        """Store the reference HR, online WFPV estimate, selected spectral peak, and
+        tracking interval for the current analysis window."""
         rows.append(
             {
                 "record": record.name,
@@ -312,7 +426,9 @@ def estimate_temko_wfpv(
 
     return pd.DataFrame(rows)
 
-
+"""Compare the online WFPV estimates with BPM0 and calculate avAE, avRE, sdAE,
+Pearson correlation, Bland--Altman bias, and the 95% limits of agreement.
+"""
 def metric_row(df: pd.DataFrame, record_name: str, split: str) -> dict[str, float | int | str]:
     valid = df[["hr_true_bpm", "temko_wfpv_hr_bpm"]].dropna()
     row: dict[str, float | int | str] = {
@@ -355,14 +471,60 @@ def metric_row(df: pd.DataFrame, record_name: str, split: str) -> dict[str, floa
     return row
 
 
+def record_equal_summary(
+    windows: pd.DataFrame,
+    per_record: pd.DataFrame,
+    record_name: str,
+    split: str,
+    temko_report_label: str,
+) -> dict[str, float | int | str]:
+    """Aggregate error metrics with equal weight per recording, as in Temko's MATLAB summary."""
+    row = metric_row(windows, record_name, split)
+    row["aggregation"] = "record_equal_errors; pooled_association_and_agreement"
+    row["temko_report_label"] = temko_report_label
+    row["n_records"] = int(len(per_record))
+    row["pooled_window_mae_bpm"] = row["mae_bpm"]
+    row["pooled_window_std_abs_error_bpm"] = row["std_abs_error_bpm"]
+    row["pooled_window_mean_relative_error_percent"] = row["mean_relative_error_percent"]
+
+    if not per_record.empty:
+        row["mae_bpm"] = float(per_record["mae_bpm"].mean())
+        row["std_abs_error_bpm"] = float(per_record["std_abs_error_bpm"].mean())
+        row["mean_relative_error_percent"] = float(per_record["mean_relative_error_percent"].mean())
+    return row
+
+
 def build_metrics(windows: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    per_record_rows = []
     for record_name, record_df in windows.groupby("record", sort=False):
         split = str(record_df["split"].iloc[0])
-        rows.append(metric_row(record_df, record_name, split))
+        row = metric_row(record_df, record_name, split)
+        row["aggregation"] = "per_record_windows"
+        row["temko_report_label"] = ""
+        row["n_records"] = 1
+        row["pooled_window_mae_bpm"] = row["mae_bpm"]
+        row["pooled_window_std_abs_error_bpm"] = row["std_abs_error_bpm"]
+        row["pooled_window_mean_relative_error_percent"] = row["mean_relative_error_percent"]
+        per_record_rows.append(row)
+
+    per_record = pd.DataFrame(per_record_rows)
+    rows = list(per_record_rows)
     for split, split_df in windows.groupby("split", sort=False):
-        rows.append(metric_row(split_df, f"ALL_{split}", split))
-    rows.append(metric_row(windows, "ALL_DATABASE", "all"))
+        split_records = per_record[per_record["split"] == split]
+        if split == "training" and len(split_records) == 12:
+            report_label = "Err12"
+        else:
+            report_label = f"Err{len(split_records)}_{split}_available"
+        rows.append(record_equal_summary(split_df, split_records, f"ALL_{split}", split, report_label))
+    rows.append(
+        record_equal_summary(
+            windows,
+            per_record,
+            "ALL_DATABASE",
+            "all",
+            f"ErrAll{len(per_record)}_available",
+        )
+    )
     return pd.DataFrame(rows)
 
 
@@ -415,7 +577,7 @@ def plot_scatter(windows: pd.DataFrame, metrics: pd.DataFrame, outdir: Path) -> 
     ax.text(
         0.04,
         0.96,
-        f"ALL: r={overall['pearson_r']:.3f}\\nMAE={overall['mae_bpm']:.2f} bpm",
+        f"ALL: r={overall['pearson_r']:.3f}\\nrecord-equal MAE={overall['mae_bpm']:.2f} bpm",
         transform=ax.transAxes,
         va="top",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.82, "edgecolor": "none"},
@@ -505,9 +667,27 @@ def main() -> None:
 
     windows_path = args.outdir / "temko_wfpv_database_windows.csv"
     metrics_path = args.outdir / "temko_wfpv_database_metrics.csv"
+    matlab_summary_path = args.outdir / "temko_wfpv_matlab_style_summary.csv"
     config_path = args.outdir / "temko_wfpv_database_config.csv"
     windows.to_csv(windows_path, index=False)
     metrics.to_csv(metrics_path, index=False)
+    metrics[metrics["record"].str.startswith("ALL_")][
+        [
+            "temko_report_label",
+            "record",
+            "split",
+            "n_records",
+            "n_windows",
+            "mae_bpm",
+            "std_abs_error_bpm",
+            "mean_relative_error_percent",
+            "pooled_window_mae_bpm",
+            "pearson_r",
+            "bias_bpm",
+            "bland_altman_lower_bpm",
+            "bland_altman_upper_bpm",
+        ]
+    ].to_csv(matlab_summary_path, index=False)
     pd.DataFrame(
         [
             {
@@ -523,6 +703,10 @@ def main() -> None:
                 "search_low_hz": args.search_low_hz,
                 "search_high_hz": args.search_high_hz,
                 "wf_length": args.wf_length,
+                "error_summary_aggregation": "record_equal_as_in_Temko_MATLAB",
+                "available_record_count": len(records),
+                "reference_matlab_record_count": 23,
+                "missing_reference_record": "DATA_S04_T01",
             }
         ]
     ).to_csv(config_path, index=False)
@@ -539,6 +723,7 @@ def main() -> None:
 
     print(f"Wrote windows: {windows_path}")
     print(f"Wrote metrics: {metrics_path}")
+    print(f"Wrote MATLAB-style summary: {matlab_summary_path}")
     print(f"Wrote config: {config_path}")
     print("Plots:")
     for path in plot_paths:

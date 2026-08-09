@@ -105,6 +105,13 @@ def extract_acc_channels(record: DatabaseRecord, sig: np.ndarray) -> np.ndarray:
         raise ValueError(f"{record.name}: training record should contain ECG/PPG1/PPG2/ACC_XYZ")
     return sig[3:6]
 
+"""
+These codes are used to preprocessing
+Each PPG Window is first checked for non-finite values and bandpass filtered between 0.4 and 4 Hz (24 to 240 bpm) 
+using a 4th-order Butterworth filter. 
+The two PPG channels are then standardised separately within each window 
+so that amplitude differences do not cause one channel to dominate the subsequent fusion.
+"""
 
 def fill_nan_1d(x: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
     x = np.asarray(x, dtype=float).copy()
@@ -136,6 +143,14 @@ def bandpass_signal(x: np.ndarray, fs: float, low_hz: float, high_hz: float, ord
 def preprocess_ppg_window(x: np.ndarray, fs: float, low_hz: float, high_hz: float, order: int) -> np.ndarray:
     return zscore(bandpass_signal(x, fs=fs, low_hz=low_hz, high_hz=high_hz, order=order))
 
+"""Fast Fourier Transform (FFT) Based Herat Rate Estimation
+The fused PPG window is demeaned and multiplied by a Hann window to reduce spectral laeakage.
+A one-sided FFT with zero-padding to 4096 points is then computed. 
+The frequency with the largest spectral power between 0.8 and3.0 Hz is selected and converted to beats per minute.
+
+This baseline relies only on dominant spectral peak selection and 
+therefore cannot distinguish a cardiac peak from a stronger motion-artifact peak.
+"""
 
 def fft_peak_hr(
     x: np.ndarray,
@@ -158,6 +173,9 @@ def fft_peak_hr(
     peak_hz = float(freqs[band][idx])
     return peak_hz, peak_hz * 60.0, float(band_power[idx])
 
+"""Window-Based Processing
+Each recording is divided into 8s windows with a 2s step, corresponding to a 75% overlap at 125 Hz.
+Each window is processed independently and aligned with the corresponding BPM0 reference value."""
 
 def estimate_ppg_fft_record(
     record: DatabaseRecord,
@@ -184,6 +202,9 @@ def estimate_ppg_fft_record(
         cur = slice(idx * step, idx * step + window)
         ppg1_proc = preprocess_ppg_window(ppg1[cur], fs, ppg_low_hz, ppg_high_hz, filter_order)
         ppg2_proc = preprocess_ppg_window(ppg2[cur], fs, ppg_low_hz, ppg_high_hz, filter_order)
+        """The two preprocessed PPG channels are fused by equal-weight averaging.
+        Since both channels are standardised beforehand, 
+        the averaging is not dominated solely by differences in their original amplitudes scales."""
         ppg_mean = 0.5 * ppg1_proc + 0.5 * ppg2_proc
         peak_hz, hr_raw, peak_power = fft_peak_hr(
             ppg_mean,
@@ -211,6 +232,12 @@ def estimate_ppg_fft_record(
         )
     return pd.DataFrame(rows)
 
+"""Postprocessing
+Post-processing is performed separately for each recording.
+Estimates outside the predefined physiological range are marked as invalid and, 
+under the default setting, internal missing values are linearly interpolated. 
+A trailing moving average over the current and four preceding windows is then applied to reduce short-term fluctuations.
+"""
 
 def postprocess_by_record(
     df: pd.DataFrame,
@@ -245,6 +272,10 @@ def postprocess_by_record(
         pieces.append(record_df)
     return pd.concat(pieces, ignore_index=True)
 
+"""Performance Evaluation
+The final HR estimates are compared with the provided BPM0 reference values.
+The script calculates avAE, avRE, sdAE, Pearson correlation coefficient, and Bland-Altman bias, and the corresponding 95%
+limits of agreement."""
 
 def method_metrics(df: pd.DataFrame, record_name: str, split: str, method: str, est_col: str) -> dict:
     valid = df[["hr_true_bpm", est_col]].dropna()
@@ -289,40 +320,127 @@ def method_metrics(df: pd.DataFrame, record_name: str, split: str, method: str, 
 
 
 def build_metrics(df: pd.DataFrame, methods: list[tuple[str, str]]) -> pd.DataFrame:
-    rows = []
+    per_record_rows = []
     for record_name, record_df in df.groupby("record", sort=False):
         split = str(record_df["split"].iloc[0])
         for method, est_col in methods:
             if est_col in record_df:
-                rows.append(method_metrics(record_df, record_name, split, method, est_col))
+                row = method_metrics(record_df, record_name, split, method, est_col)
+                row["aggregation"] = "per_record_windows"
+                row["temko_report_label"] = ""
+                row["n_records"] = 1
+                row["pooled_window_mae_bpm"] = row["mae_bpm"]
+                row["pooled_window_std_abs_error_bpm"] = row["std_abs_error_bpm"]
+                row["pooled_window_mean_relative_error_percent"] = row["mean_relative_error_percent"]
+                per_record_rows.append(row)
+
+    per_record = pd.DataFrame(per_record_rows)
+    rows = per_record_rows.copy()
+
     for split, split_df in df.groupby("split", sort=False):
         for method, est_col in methods:
             if est_col in split_df:
-                rows.append(method_metrics(split_df, f"ALL_{split}", split, method, est_col))
+                scope = per_record[
+                    (per_record["split"] == split) & (per_record["method"] == method)
+                ]
+                report_label = (
+                    "Err12"
+                    if split == "training" and len(scope) == 12
+                    else f"Err{len(scope)}_{split}_available"
+                )
+                rows.append(
+                    record_equal_summary(
+                        split_df,
+                        scope,
+                        f"ALL_{split}",
+                        split,
+                        method,
+                        est_col,
+                        report_label,
+                    )
+                )
+
     for method, est_col in methods:
         if est_col in df:
-            rows.append(method_metrics(df, "ALL_DATABASE", "all", method, est_col))
+            scope = per_record[per_record["method"] == method]
+            rows.append(
+                record_equal_summary(
+                    df,
+                    scope,
+                    "ALL_DATABASE",
+                    "all",
+                    method,
+                    est_col,
+                    f"ErrAll{len(scope)}_available",
+                )
+            )
     return pd.DataFrame(rows)
+
+
+def record_equal_summary(
+    windows: pd.DataFrame,
+    per_record: pd.DataFrame,
+    record_name: str,
+    split: str,
+    method: str,
+    est_col: str,
+    report_label: str,
+) -> dict:
+    """Use Temko-style record-equal errors while retaining pooled agreement metrics."""
+    row = method_metrics(windows, record_name, split, method, est_col)
+    row["aggregation"] = "record_equal_errors; pooled_association_and_agreement"
+    row["temko_report_label"] = report_label
+    row["n_records"] = int(len(per_record))
+    row["pooled_window_mae_bpm"] = row["mae_bpm"]
+    row["pooled_window_std_abs_error_bpm"] = row["std_abs_error_bpm"]
+    row["pooled_window_mean_relative_error_percent"] = row["mean_relative_error_percent"]
+
+    if not per_record.empty:
+        row["mae_bpm"] = float(per_record["mae_bpm"].mean())
+        row["std_abs_error_bpm"] = float(per_record["std_abs_error_bpm"].mean())
+        row["mean_relative_error_percent"] = float(
+            per_record["mean_relative_error_percent"].mean()
+        )
+    return row
 
 
 def plot_time_series(df: pd.DataFrame, record_name: str, outdir: Path) -> Path:
     record_df = df[df["record"] == record_name]
+    metric = method_metrics(record_df, record_name, str(record_df["split"].iloc[0]), "PPG FFT", "ppg_fft_hr_est_bpm")
     fig, ax = plt.subplots(figsize=(12.0, 4.8), constrained_layout=True)
-    ax.plot(record_df["center_time_s"] / 60.0, record_df["hr_true_bpm"], label="BPM0 true HR", linewidth=1.6)
+    ax.plot(
+        record_df["center_time_s"] / 60.0,
+        record_df["hr_true_bpm"],
+        label="BPM0 true HR",
+        linewidth=2.0,
+        color="#222222",
+    )
     ax.plot(
         record_df["center_time_s"] / 60.0,
         record_df["ppg_fft_hr_est_bpm"],
         label="PPG FFT",
-        linewidth=1.15,
-        color="#d62728",
+        linewidth=1.45,
+        color="#0072B2",
     )
     ax.set_title(f"DATABASE PPG FFT HR vs BPM0: {record_name}")
     ax.set_xlabel("Time (min)")
     ax.set_ylabel("Heart rate (bpm)")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
+    ax.text(
+        0.985,
+        0.06,
+        f"MAE={metric['mae_bpm']:.2f} bpm\n"
+        f"sdAE={metric['std_abs_error_bpm']:.2f} bpm\n"
+        f"r={metric['pearson_r']:.3f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=10,
+        bbox={"facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.88, "pad": 4},
+    )
     path = outdir / f"{record_name}_timeseries_ppg_fft_vs_bpm0.png"
-    fig.savefig(path, dpi=200)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -331,13 +449,19 @@ def plot_scatter(df: pd.DataFrame, metrics: pd.DataFrame, outdir: Path) -> Path:
     valid = df[["hr_true_bpm", "ppg_fft_hr_est_bpm"]].dropna()
     row = metrics[(metrics["record"] == "ALL_DATABASE") & (metrics["method"] == "PPG FFT")].iloc[0]
     fig, ax = plt.subplots(figsize=(6.2, 5.8), constrained_layout=True)
-    ax.scatter(valid["hr_true_bpm"], valid["ppg_fft_hr_est_bpm"], s=12, alpha=0.35)
+    ax.scatter(valid["hr_true_bpm"], valid["ppg_fft_hr_est_bpm"], s=12, alpha=0.35, color="#0072B2")
     lo = float(valid.min().min() - 5)
     hi = float(valid.max().max() + 5)
     ax.plot([lo, hi], [lo, hi], color="black", linewidth=1.0)
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
-    ax.text(0.04, 0.96, f"r={row['pearson_r']:.3f}\nMAE={row['mae_bpm']:.2f} bpm", transform=ax.transAxes, va="top")
+    ax.text(
+        0.04,
+        0.96,
+        f"r={row['pearson_r']:.3f}\navAE_rec={row['mae_bpm']:.2f} bpm",
+        transform=ax.transAxes,
+        va="top",
+    )
     ax.set_title("DATABASE PPG FFT HR correlation")
     ax.set_xlabel("BPM0 true HR (bpm)")
     ax.set_ylabel("PPG FFT HR (bpm)")
@@ -381,7 +505,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-sec", type=float, default=8.0)
     parser.add_argument("--step-sec", type=float, default=2.0)
     parser.add_argument("--n-fft", type=int, default=4096)
-    parser.add_argument("--search-low-hz", type=float, default=0.8)
+    parser.add_argument("--search-low-hz", type=float, default=1.0)
     parser.add_argument("--search-high-hz", type=float, default=3.0)
     parser.add_argument("--ppg-low-hz", type=float, default=0.4)
     parser.add_argument("--ppg-high-hz", type=float, default=4.0)
@@ -390,10 +514,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--physio-high-bpm", type=float, default=220.0)
     parser.add_argument("--smooth-windows", type=int, default=5)
     parser.add_argument("--outlier-policy", choices=["interpolate", "previous", "nan"], default="interpolate")
-    parser.add_argument("--plot-records", nargs="+", default=["DATA_01_TYPE01", "DATA_08_TYPE02", "TEST_S01_T01", "TEST_S07_T02"])
+    parser.add_argument(
+        "--plot-records",
+        nargs="+",
+        default=["DATA_01_TYPE01", "DATA_08_TYPE02", "DATA_10_TYPE02", "TEST_S01_T01", "TEST_S07_T02"],
+    )
     return parser.parse_args()
 
-
+""" Complete PPG-only FFT HR estimation pipeline for DATABASE. 
+The main function loads all selected recordings, applies the complete PPG-only FFT pipline, performs record-wise 
+post-processing, calculates the evaluation metrics, and exports the numerical results and figures."""
 def main() -> None:
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +583,7 @@ def main() -> None:
                 "search_low_hz": args.search_low_hz,
                 "search_high_hz": args.search_high_hz,
                 "smooth_windows": args.smooth_windows,
+                "error_summary_aggregation": "record_equal_as_in_Temko_MATLAB",
             }
         ]
     ).to_csv(config_csv, index=False)

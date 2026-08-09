@@ -44,8 +44,10 @@ from temko_wfpv_database_analysis import (
 
 
 DEFAULT_OUTDIR = Path("outputs_database_temko_wfpv_vd")
-
-
+"""
+Store the complete WFPV spectral observations and phase-vocoder-refined
+frequency grids required by the later offline Viterbi decoding stage.
+"""
 @dataclass(frozen=True)
 class WfpvEmission:
     record: DatabaseRecord
@@ -76,12 +78,15 @@ def matlab_zscore(x: np.ndarray) -> np.ndarray:
         return np.zeros_like(y)
     return (y - float(np.mean(y))) / std
 
-
+"""Reproduce the MATLAB moving.m operation used in Temko's offline code.
+It is later applied to the final Viterbi-decoded HR trajectory."""
 def matlab_moving_1d(x: np.ndarray, width: int) -> np.ndarray:
-    """Approximate Aslak Grinsted's MATLAB moving.m for a vector."""
+    """Reproduce Aslak Grinsted's MATLAB moving.m for a 1D vector."""
     x = np.asarray(x, dtype=float).reshape(-1)
     if width <= 1 or x.size == 0:
         return x.copy()
+    if width > x.size:
+        raise ValueError("moving-average width must not exceed the input length")
     filt = np.ones(width, dtype=float) / width
     y = signal.lfilter(filt, [1.0], x)
     n = x.size
@@ -94,16 +99,21 @@ def matlab_moving_1d(x: np.ndarray, width: int) -> np.ndarray:
     )
     return y[np.asarray(idx, dtype=int)]
 
-
+"""Apply the MATLAB moving operation independently to each matrix column.
+his is used to smooth the estimated transition probabilities."""
 def matlab_moving_axis0(x: np.ndarray, width: int) -> np.ndarray:
-    """Moving average along axis 0 with edge behavior close to moving.m."""
+    """Apply MATLAB moving.m independently along axis 0."""
     x = np.asarray(x, dtype=float)
     if x.ndim == 1:
         return matlab_moving_1d(x, width)
     cols = [matlab_moving_1d(x[:, col], width) for col in range(x.shape[1])]
     return np.column_stack(cols)
 
-
+"""Apply the same preprocessing, phase-vocoder refinement, and Wiener spectral
+attenuation as in the online WFPV method. Instead of selecting one HR peak
+immediately, retain the complete cleaned spectrum of every window as the
+emission evidence for offline decoding.
+"""
 def compute_wfpv_emission(
     record: DatabaseRecord,
     sig: np.ndarray,
@@ -121,7 +131,10 @@ def compute_wfpv_emission(
     window = int(round(window_sec * fs))
     step = int(round(step_sec * fs))
     window_nb = int(np.floor((sig.shape[1] - window) / step) + 1)
-    window_nb = min(window_nb, len(bpm0))
+    if window_nb != len(bpm0):
+        raise ValueError(
+            f"{record.name}: signal yields {window_nb} windows but BPM0 contains {len(bpm0)} values"
+        )
     target_fs = fs / 5.0
 
     freq_range_all = np.linspace(0.0, target_fs, fft_res)
@@ -195,6 +208,9 @@ def compute_wfpv_emission(
         if w2_std > np.finfo(float).eps:
             w2_clean = w2_clean / w2_std
 
+            """Store the combined WF1 and WF2 spectrum as the emission evidence for all
+            possible HR states in the current window."""
+
         emissions.append(w1_clean + w2_clean)
         centers.append(i * step_sec + window_sec / 2.0)
 
@@ -207,15 +223,24 @@ def compute_wfpv_emission(
         emission=np.vstack(emissions),
     )
 
-
+"""Estimate the probabilities of transitions between consecutive HR states from
+the BPM0 trajectories of all records except the record currently being
+decoded. This implements the leave-one-record-out procedure.
+"""
 def transition_matrix_from_truth(
     emissions_by_record: dict[str, WfpvEmission],
     held_out_name: str,
     freq_range_hz: np.ndarray,
 ) -> np.ndarray:
     num_states = len(freq_range_hz)
+    """Divide the HR interval from 60 to 180 BPM into the same number of discrete
+    states as the frequency bins in the WFPV emission spectrum."""
     edges = np.linspace(60.0, 180.0, num_states + 1)
     trans = np.zeros((num_states, num_states), dtype=float)
+
+    """Use only the reference traces of the remaining records when estimating the
+    transition probabilities for the current held-out record.
+    """
 
     for name, emission in emissions_by_record.items():
         if name == held_out_name:
@@ -223,19 +248,25 @@ def transition_matrix_from_truth(
         bpm0 = np.asarray(emission.bpm0, dtype=float)
         if bpm0.size < 2:
             continue
+        """Map each BPM0 value to its corresponding discrete HR state."""
         bins = np.searchsorted(edges, bpm0, side="right")
         bins[bins == 0] = 1
         bins[bins > num_states] = num_states
         bins = bins.astype(int) - 1
+        """Count the transitions between consecutive reference HR states."""
         for src, dst in zip(bins[:-1], bins[1:]):
             trans[src, dst] += 1.0
+
+            """Normalise each row to obtain the conditional probability of the next state
+            given the current HR state."""
 
     row_sums = trans.sum(axis=1, keepdims=True)
     out = np.divide(trans, row_sums, out=np.full_like(trans, np.finfo(float).eps), where=row_sums > 0)
     out[~np.isfinite(out)] = np.finfo(float).eps
     return out
 
-
+"""Determine the globally best HR-state path by combining the WFPV spectral
+evidence with the learned transition probabilities over the complete record."""
 def viterbi_path(transition: np.ndarray, emission: np.ndarray) -> np.ndarray:
     """Replicate viterbi_path2.m using log transition and raw emission values."""
     e = np.asarray(emission, dtype=float)
@@ -245,14 +276,23 @@ def viterbi_path(transition: np.ndarray, emission: np.ndarray) -> np.ndarray:
     if num_frames == 0:
         return np.asarray([], dtype=int)
 
+    """Convert the transition probabilities to the logarithmic domain for the
+    dynamic-programming recursion."""
+
     with np.errstate(divide="ignore"):
         log_tr = np.log(np.asarray(transition, dtype=float))
     log_tr[~np.isfinite(log_tr)] = -np.inf
+
+    """Store the best predecessor of every state at each window for later backtracking to obtain the optimal HR-state path.
+    """
 
     ptr = np.zeros((num_states, num_frames), dtype=int)
     diag = np.diag(log_tr)
     v_old = diag * e[:, 0]
     v = np.full(num_states, -np.inf, dtype=float)
+
+    """Recursively calculate the best cumulative score for every HR state at each
+    analysis window."""
 
     for count in range(num_frames):
         for state in range(num_states):
@@ -262,25 +302,47 @@ def viterbi_path(transition: np.ndarray, emission: np.ndarray) -> np.ndarray:
             v[state] = e[state, count] + vals[best_prev]
         v_old = v.copy()
 
+        """Backtrack from the highest-scoring final state to recover the complete
+        globally consistent HR-state path.
+        """
+
     path = np.zeros(num_frames, dtype=int)
     path[-1] = int(np.argmax(v))
     for count in range(num_frames - 2, -1, -1):
         path[count] = ptr[path[count + 1], count + 1]
     return path
 
-
+"""Decode each recording using a transition model estimated from the remaining
+records, convert the decoded states to BPM, and apply the final temporal 
+smoothing used by Temko's offline method.
+"""
 def estimate_offline_vd(emissions_by_record: dict[str, WfpvEmission]) -> pd.DataFrame:
     rows: list[dict[str, float | int | str]] = []
 
     for name, emission in emissions_by_record.items():
         transition = transition_matrix_from_truth(emissions_by_record, name, emission.freq_range_hz)
+        """Smooth the transition probabilities using the four-point MATLAB moving
+        operation before Viterbi decoding.
+        """
         transition = matlab_moving_axis0(transition.T, 4).T
+        """Apply Viterbi decoding. The emission matrix is transposed so that rows
+        represent HR states and columns represent analysis windows.
+        """
         state_path = viterbi_path(transition, emission.emission.T)
+        """Convert each decoded state to BPM using the phase-vocoder-refined frequency
+        grid of the corresponding analysis window.
+        """
         raw_hr = np.asarray(
             [emission.freq_range_ppg_hz[i, state] * 60.0 for i, state in enumerate(state_path)],
             dtype=float,
         )
+        """Apply the four-point MATLAB moving operation to the decoded HR trajectory.
+        The smoothed sequence is used as the final offline WFPV+VD estimate.
+        """
         smoothed_hr = matlab_moving_1d(raw_hr, 4)
+
+        """Store the reference HR, raw Viterbi estimate, smoothed final estimate, and
+        decoded state for every analysis window."""
 
         for i, (truth, raw, smooth, state) in enumerate(zip(emission.bpm0, raw_hr, smoothed_hr, state_path)):
             center_s = float(emission.center_time_s[i])
@@ -306,7 +368,9 @@ def estimate_offline_vd(emissions_by_record: dict[str, WfpvEmission]) -> pd.Data
     windows["relative_abs_error_percent"] = windows["abs_error_bpm"] / windows["hr_true_bpm"] * 100.0
     return windows
 
-
+"""Compare the final offline WFPV+VD estimates with BPM0 and calculate avAE,
+avRE, sdAE, Pearson correlation, Bland--Altman bias, and limits of agreement.
+"""
 def metric_row(df: pd.DataFrame, record_name: str, split: str) -> dict[str, float | int | str]:
     valid = df[["hr_true_bpm", "temko_wfpv_vd_hr_bpm"]].dropna()
     row: dict[str, float | int | str] = {
@@ -349,14 +413,60 @@ def metric_row(df: pd.DataFrame, record_name: str, split: str) -> dict[str, floa
     return row
 
 
+def record_equal_summary(
+    windows: pd.DataFrame,
+    per_record: pd.DataFrame,
+    record_name: str,
+    split: str,
+    temko_report_label: str,
+) -> dict[str, float | int | str]:
+    """Aggregate error metrics with equal weight per recording, as in Temko's MATLAB summary."""
+    row = metric_row(windows, record_name, split)
+    row["aggregation"] = "record_equal_errors; pooled_association_and_agreement"
+    row["temko_report_label"] = temko_report_label
+    row["n_records"] = int(len(per_record))
+    row["pooled_window_mae_bpm"] = row["mae_bpm"]
+    row["pooled_window_std_abs_error_bpm"] = row["std_abs_error_bpm"]
+    row["pooled_window_mean_relative_error_percent"] = row["mean_relative_error_percent"]
+
+    if not per_record.empty:
+        row["mae_bpm"] = float(per_record["mae_bpm"].mean())
+        row["std_abs_error_bpm"] = float(per_record["std_abs_error_bpm"].mean())
+        row["mean_relative_error_percent"] = float(per_record["mean_relative_error_percent"].mean())
+    return row
+
+
 def build_metrics(windows: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    per_record_rows = []
     for record_name, record_df in windows.groupby("record", sort=False):
         split = str(record_df["split"].iloc[0])
-        rows.append(metric_row(record_df, record_name, split))
+        row = metric_row(record_df, record_name, split)
+        row["aggregation"] = "per_record_windows"
+        row["temko_report_label"] = ""
+        row["n_records"] = 1
+        row["pooled_window_mae_bpm"] = row["mae_bpm"]
+        row["pooled_window_std_abs_error_bpm"] = row["std_abs_error_bpm"]
+        row["pooled_window_mean_relative_error_percent"] = row["mean_relative_error_percent"]
+        per_record_rows.append(row)
+
+    per_record = pd.DataFrame(per_record_rows)
+    rows = list(per_record_rows)
     for split, split_df in windows.groupby("split", sort=False):
-        rows.append(metric_row(split_df, f"ALL_{split}", split))
-    rows.append(metric_row(windows, "ALL_DATABASE", "all"))
+        split_records = per_record[per_record["split"] == split]
+        if split == "training" and len(split_records) == 12:
+            report_label = "Err12"
+        else:
+            report_label = f"Err{len(split_records)}_{split}_available"
+        rows.append(record_equal_summary(split_df, split_records, f"ALL_{split}", split, report_label))
+    rows.append(
+        record_equal_summary(
+            windows,
+            per_record,
+            "ALL_DATABASE",
+            "all",
+            f"ErrAll{len(per_record)}_available",
+        )
+    )
     return pd.DataFrame(rows)
 
 
@@ -415,7 +525,7 @@ def plot_scatter(windows: pd.DataFrame, metrics: pd.DataFrame, outdir: Path) -> 
     ax.text(
         0.04,
         0.96,
-        f"ALL: r={overall['pearson_r']:.3f}\\nMAE={overall['mae_bpm']:.2f} bpm",
+        f"ALL: r={overall['pearson_r']:.3f}\\nrecord-equal MAE={overall['mae_bpm']:.2f} bpm",
         transform=ax.transAxes,
         va="top",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.82, "edgecolor": "none"},
@@ -479,6 +589,14 @@ def main() -> None:
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     records = discover_records(args.data_dir, args.records)
+    if len(records) < 2:
+        raise ValueError("Offline leave-one-record-out Viterbi decoding requires at least two records")
+    if len(records) != 23 or "DATA_S04_T01" not in {record.name for record in records}:
+        print(
+            "WARNING: Temko's reference experiment uses 23 records including DATA_S04_T01; "
+            f"this run has {len(records)} records, so each transition matrix is trained from "
+            f"{len(records) - 1} available records."
+        )
     emissions_by_record: dict[str, WfpvEmission] = {}
     for record in records:
         sig, bpm0 = load_record(record)
@@ -501,9 +619,27 @@ def main() -> None:
 
     windows_path = args.outdir / "temko_wfpv_vd_database_windows.csv"
     metrics_path = args.outdir / "temko_wfpv_vd_database_metrics.csv"
+    matlab_summary_path = args.outdir / "temko_wfpv_vd_matlab_style_summary.csv"
     config_path = args.outdir / "temko_wfpv_vd_database_config.csv"
     windows.to_csv(windows_path, index=False)
     metrics.to_csv(metrics_path, index=False)
+    metrics[metrics["record"].str.startswith("ALL_")][
+        [
+            "temko_report_label",
+            "record",
+            "split",
+            "n_records",
+            "n_windows",
+            "mae_bpm",
+            "std_abs_error_bpm",
+            "mean_relative_error_percent",
+            "pooled_window_mae_bpm",
+            "pearson_r",
+            "bias_bpm",
+            "bland_altman_lower_bpm",
+            "bland_altman_upper_bpm",
+        ]
+    ].to_csv(matlab_summary_path, index=False)
     pd.DataFrame(
         [
             {
@@ -513,6 +649,10 @@ def main() -> None:
                 "data_dir": str(args.data_dir),
                 "records": ",".join(records_by_name for records_by_name in emissions_by_record),
                 "n_records_available": len(emissions_by_record),
+                "transition_training_records_per_held_out": len(emissions_by_record) - 1,
+                "reference_matlab_record_count": 23,
+                "reference_transition_training_records_per_held_out": 22,
+                "missing_reference_record": "DATA_S04_T01",
                 "fs_hz": args.fs,
                 "window_sec": args.window_sec,
                 "step_sec": args.step_sec,
@@ -522,6 +662,7 @@ def main() -> None:
                 "search_high_hz": args.search_high_hz,
                 "wf_length": args.wf_length,
                 "evaluation_hr": "temko_wfpv_vd_hr_bpm, after MATLAB moving(...,4) smoothing",
+                "error_summary_aggregation": "record_equal_as_in_Temko_MATLAB",
             }
         ]
     ).to_csv(config_path, index=False)
@@ -538,6 +679,7 @@ def main() -> None:
 
     print(f"Wrote windows: {windows_path}")
     print(f"Wrote metrics: {metrics_path}")
+    print(f"Wrote MATLAB-style summary: {matlab_summary_path}")
     print(f"Wrote config: {config_path}")
     print("Plots:")
     for path in plot_paths:

@@ -41,7 +41,14 @@ from ppg_fft_hr_analysis import (
 
 
 DEFAULT_OUTDIR = Path("outputs_database_ppg_nlms_acc_fft_hr")
-
+"""ACC-REFERENCED NLMS ARTIFACT CANCELLATION 
+The fused PPG signal is used as the desired input, while the three standardised acceleration axes 
+and their delayed samples form the NLMS reference vector. The adaptive filter estimates the PPG component correlated
+with wrist acceleration. This estimate is subtracted from the PPG signal, and the resulting residual is treated as 
+the motion-attenuated PPG signal.
+In the reported experiments, the number of time lags is L = 32, giving 3L = 96 adaptive coefficients. The step size is 
+mu = 0.005, and the regularization parameter is eps = 1e-6. The filter order is set to 4 for the bandpass filter.
+ """
 
 def nlms_artifact_cancel(
     desired: np.ndarray,
@@ -50,7 +57,11 @@ def nlms_artifact_cancel(
     mu: float,
     eps: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Use multi-reference NLMS to estimate ACC-correlated artifact and return the error signal."""
+    """Estimate the ACC-correlated component and return residual and artifact.
+
+    Both returned signals use the scale of the standardized desired PPG, so
+    their amplitudes and variances remain directly comparable.
+    """
     desired = np.asarray(desired, dtype=float)
     references = np.asarray(references, dtype=float)
     if references.ndim != 2:
@@ -61,6 +72,12 @@ def nlms_artifact_cancel(
         raise ValueError("filter_order must be >= 1")
     if not (0.0 < mu < 2.0):
         raise ValueError("NLMS mu should be in (0, 2)")
+    if eps <= 0.0:
+        raise ValueError("eps must be > 0")
+    if references.shape[1] < 1:
+        raise ValueError("references must contain at least one channel")
+
+    """ Standardise the desired PPG signal and each acceleration reference. """
 
     d = zscore(desired)
     x = np.column_stack([zscore(references[:, i]) for i in range(references.shape[1])])
@@ -72,18 +89,43 @@ def nlms_artifact_cancel(
     for n in range(n_samples):
         x_vec = np.zeros(filter_order * n_channels, dtype=float)
         available = min(filter_order, n + 1)
+        """Construct the reference vector with the current and previous samples for each channel."""
         history = x[n - available + 1 : n + 1][::-1]
         x_vec[: available * n_channels] = history.reshape(-1)
 
+        """Estimate the acceleration-correlated artifact and calculate the residual."""
+
         y_hat = float(weights @ x_vec)
         error = d[n] - y_hat
+
+        """ Update the adaptive coefficients using the NLMS algorithm. The weights are updated based on the error and the reference vector. """
         weights += (mu / (float(x_vec @ x_vec) + eps)) * error * x_vec
 
         artifact[n] = y_hat
         cleaned[n] = error
 
-    return zscore(cleaned), artifact
+    return cleaned, artifact
 
+
+def acc_as_axes_by_samples(acc: np.ndarray, sample_count: int, record_name: str) -> np.ndarray:
+    """Return a three-axis ACC array with shape (3, samples)."""
+    acc = np.asarray(acc, dtype=float)
+    if acc.ndim != 2:
+        raise ValueError(f"{record_name}: expected a 2D ACC array, got {acc.shape}")
+    if acc.shape == (3, sample_count):
+        return acc
+    if acc.shape == (sample_count, 3):
+        return acc.T
+    raise ValueError(
+        f"{record_name}: expected ACC shape (3, {sample_count}) or "
+        f"({sample_count}, 3), got {acc.shape}"
+    )
+
+""" Construction of the NLMS input signals
+The two complete PPG recordings are band-pass filtered between 0.4 and 4 Hz, standardised separately, and combined by equal
+weight averaging. The resulting fused PPG signals forms the desired NLMS input. 
+The three complete acceleration channels are filtered in the same frequency band and standardised separately before being used
+as motion references."""
 
 def make_nlms_cleaned_ppg(
     record: DatabaseRecord,
@@ -97,15 +139,17 @@ def make_nlms_cleaned_ppg(
     nlms_eps: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     ppg1, ppg2 = extract_ppg_channels(record, sig)
-    acc = extract_acc_channels(record, sig)
+    acc = acc_as_axes_by_samples(extract_acc_channels(record, sig), sig.shape[1], record.name)
 
     ppg1_proc = zscore(bandpass_signal(ppg1, fs=fs, low_hz=ppg_low_hz, high_hz=ppg_high_hz, order=filter_order))
     ppg2_proc = zscore(bandpass_signal(ppg2, fs=fs, low_hz=ppg_low_hz, high_hz=ppg_high_hz, order=filter_order))
-    desired = 0.5 * ppg1_proc + 0.5 * ppg2_proc
+    """ Fuse the two PPG channels to from the desired signal d[n]. """
+    desired = zscore(0.5 * ppg1_proc + 0.5 * ppg2_proc)
 
-    refs = []
-    for axis in acc:
-        refs.append(zscore(bandpass_signal(axis, fs=fs, low_hz=ppg_low_hz, high_hz=ppg_high_hz, order=filter_order)))
+    refs = [
+        bandpass_signal(axis, fs=fs, low_hz=ppg_low_hz, high_hz=ppg_high_hz, order=filter_order)
+        for axis in acc
+    ]
     references = np.column_stack(refs)
 
     cleaned, artifact = nlms_artifact_cancel(
@@ -117,6 +161,10 @@ def make_nlms_cleaned_ppg(
     )
     return desired, cleaned, artifact
 
+"""FFT Based HR Estimation after NLMS filtering
+The cleaned residual signal is divided into 8s windows with a 2s step.
+Each segment is demeanded, multiplied by a Hann window, and transformed using a 4096-point one-sided FFT.
+The dominant spectral peak between 0.8 and 3.0 Hz is selected and converted to beats per minute."""
 
 def estimate_signal_fft_record(
     x: np.ndarray,
@@ -163,11 +211,15 @@ def estimate_signal_fft_record(
         )
     return pd.DataFrame(rows)
 
+"""Merge the PPG only and ACC-NLMS estimates belonging to the same recording and analysis window so that both methods
+can be compared directly."""
 
 def merge_on_window(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     keys = ["record", "split", "fs_hz", "window_index", "start_time_s", "end_time_s", "center_time_s", "hr_true_bpm", "ground_truth_hr_bpm"]
     extra = [col for col in right.columns if col not in keys]
     return left.merge(right[keys + extra], on=keys, how="inner")
+
+"""Calculate the signed, absolute, and relateive abolute errors of each method with respect to the corresponding BPM0 reference value."""
 
 
 def add_errors(df: pd.DataFrame, methods: list[tuple[str, str]]) -> pd.DataFrame:
@@ -185,16 +237,16 @@ def add_errors(df: pd.DataFrame, methods: list[tuple[str, str]]) -> pd.DataFrame
 def plot_time_series(df: pd.DataFrame, record_name: str, outdir: Path) -> Path:
     record_df = df[df["record"] == record_name]
     fig, ax = plt.subplots(figsize=(12.0, 4.8), constrained_layout=True)
-    ax.plot(record_df["center_time_s"] / 60.0, record_df["hr_true_bpm"], label="BPM0 true HR", linewidth=1.7, color="#1f77b4")
-    ax.plot(record_df["center_time_s"] / 60.0, record_df["ppg_fft_hr_est_bpm"], label="PPG FFT", linewidth=1.05, color="#ff7f0e")
-    ax.plot(record_df["center_time_s"] / 60.0, record_df["ppg_acc_nlms_fft_hr_est_bpm"], label="ACC-NLMS FFT", linewidth=1.2, color="#d62728")
+    ax.plot(record_df["center_time_s"] / 60.0, record_df["hr_true_bpm"], label="BPM0 true HR", linewidth=2.0, color="#222222")
+    ax.plot(record_df["center_time_s"] / 60.0, record_df["ppg_fft_hr_est_bpm"], label="PPG FFT", linewidth=1.05, color="#0072B2")
+    ax.plot(record_df["center_time_s"] / 60.0, record_df["ppg_acc_nlms_fft_hr_est_bpm"], label="ACC-NLMS FFT", linewidth=1.2, color="#D55E00")
     ax.set_title(f"DATABASE PPG FFT and ACC-NLMS FFT vs BPM0: {record_name}")
     ax.set_xlabel("Time (min)")
     ax.set_ylabel("Heart rate (bpm)")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False)
     path = outdir / f"{record_name}_timeseries_ppg_fft_nlms_vs_bpm0.png"
-    fig.savefig(path, dpi=200)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -202,7 +254,7 @@ def plot_time_series(df: pd.DataFrame, record_name: str, outdir: Path) -> Path:
 def plot_mae(metrics: pd.DataFrame, outdir: Path) -> Path:
     records = ["ALL_training", "ALL_competition", "ALL_DATABASE"]
     methods = ["PPG FFT", "ACC-NLMS FFT"]
-    colors = {"PPG FFT": "#ff7f0e", "ACC-NLMS FFT": "#d62728"}
+    colors = {"PPG FFT": "#0072B2", "ACC-NLMS FFT": "#D55E00"}
     x = np.arange(len(records), dtype=float)
     width = 0.32
     fig, ax = plt.subplots(figsize=(8.8, 4.8), constrained_layout=True)
@@ -211,56 +263,79 @@ def plot_mae(metrics: pd.DataFrame, outdir: Path) -> Path:
         for record in records:
             row = metrics[(metrics["record"] == record) & (metrics["method"] == method)]
             values.append(float(row["mae_bpm"].iloc[0]) if not row.empty else np.nan)
-        ax.bar(x + (i - 0.5) * width, values, width=width, label=method, color=colors[method])
+        bars = ax.bar(
+            x + (i - 0.5) * width,
+            values,
+            width=width,
+            label=method,
+            color=colors[method],
+        )
+        ax.bar_label(bars, fmt="%.2f", padding=3, fontsize=8)
     ax.set_xticks(x)
     ax.set_xticklabels(["Training", "Competition", "All"])
-    ax.set_ylabel("MAE (bpm)")
-    ax.set_title("DATABASE MAE: PPG FFT vs ACC-NLMS FFT")
+    ax.set_ylabel("Record-equal avAE / MAE (bpm)")
+    ax.set_title("DATABASE record-equal avAE: PPG FFT vs ACC-NLMS FFT")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(frameon=False)
     path = outdir / "mae_ppg_fft_vs_acc_nlms_fft.png"
-    fig.savefig(path, dpi=200)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
 def plot_scatter(df: pd.DataFrame, metrics: pd.DataFrame, outdir: Path) -> Path:
     specs = [
-        ("PPG FFT", "ppg_fft_hr_est_bpm", "#ff7f0e"),
-        ("ACC-NLMS FFT", "ppg_acc_nlms_fft_hr_est_bpm", "#d62728"),
+        ("PPG FFT", "ppg_fft_hr_est_bpm", "#0072B2"),
+        ("ACC-NLMS FFT", "ppg_acc_nlms_fft_hr_est_bpm", "#D55E00"),
     ]
-    fig, ax = plt.subplots(figsize=(6.4, 5.9), constrained_layout=True)
-    vals = [df["hr_true_bpm"].to_numpy()]
-    text_lines = []
-    for label, col, color in specs:
-        valid = df[["hr_true_bpm", col]].dropna()
-        ax.scatter(valid["hr_true_bpm"], valid[col], s=12, alpha=0.32, label=label, color=color)
-        vals.append(valid[col].to_numpy())
-        row = metrics[(metrics["record"] == "ALL_DATABASE") & (metrics["method"] == label)]
-        if not row.empty:
-            row = row.iloc[0]
-            text_lines.append(f"{label}: r={row['pearson_r']:.3f}, MAE={row['mae_bpm']:.2f}")
-    finite = np.concatenate([v[np.isfinite(v)] for v in vals if v.size])
+    values = [df["hr_true_bpm"].to_numpy()]
+    for _, col, _ in specs:
+        values.append(df[col].to_numpy())
+    finite = np.concatenate([value[np.isfinite(value)] for value in values if value.size])
     lo, hi = float(finite.min() - 5), float(finite.max() + 5)
-    ax.plot([lo, hi], [lo, hi], color="black", linewidth=1.0)
-    ax.set_xlim(lo, hi)
-    ax.set_ylim(lo, hi)
-    ax.text(0.04, 0.96, "\n".join(text_lines), transform=ax.transAxes, va="top", fontsize=9)
-    ax.set_title("DATABASE HR correlation")
-    ax.set_xlabel("BPM0 true HR (bpm)")
-    ax.set_ylabel("Estimated HR (bpm)")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="lower right")
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(10.8, 5.1),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    for ax, (label, col, color) in zip(axes, specs):
+        valid = df[["hr_true_bpm", col]].dropna()
+        ax.scatter(valid["hr_true_bpm"], valid[col], s=11, alpha=0.28, color=color)
+        ax.plot([lo, hi], [lo, hi], color="#222222", linewidth=1.1)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal", adjustable="box")
+        row = metrics[
+            (metrics["record"] == "ALL_DATABASE") & (metrics["method"] == label)
+        ].iloc[0]
+        ax.text(
+            0.04,
+            0.96,
+            f"r={row['pearson_r']:.3f}\navAE_rec={row['mae_bpm']:.2f} bpm",
+            transform=ax.transAxes,
+            va="top",
+            fontsize=9,
+            bbox={"facecolor": "white", "edgecolor": "#bbbbbb", "alpha": 0.90, "pad": 3},
+        )
+        ax.set_title(label)
+        ax.set_xlabel("BPM0 true HR (bpm)")
+        ax.grid(True, alpha=0.22)
+    axes[0].set_ylabel("Estimated HR (bpm)")
+    fig.suptitle("DATABASE HR correlation")
     path = outdir / "scatter_ppg_fft_vs_acc_nlms_fft.png"
-    fig.savefig(path, dpi=200)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
 def plot_bland_altman(df: pd.DataFrame, metrics: pd.DataFrame, outdir: Path) -> Path:
     specs = [
-        ("PPG FFT", "ppg_fft_hr_est_bpm", "#ff7f0e"),
-        ("ACC-NLMS FFT", "ppg_acc_nlms_fft_hr_est_bpm", "#d62728"),
+        ("PPG FFT", "ppg_fft_hr_est_bpm", "#0072B2"),
+        ("ACC-NLMS FFT", "ppg_acc_nlms_fft_hr_est_bpm", "#D55E00"),
     ]
     fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.8), constrained_layout=True)
     for ax, (label, col, color) in zip(axes, specs):
@@ -283,7 +358,7 @@ def plot_bland_altman(df: pd.DataFrame, metrics: pd.DataFrame, outdir: Path) -> 
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False)
     path = outdir / "bland_altman_ppg_fft_vs_acc_nlms_fft.png"
-    fig.savefig(path, dpi=200)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -297,7 +372,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-sec", type=float, default=8.0)
     parser.add_argument("--step-sec", type=float, default=2.0)
     parser.add_argument("--n-fft", type=int, default=4096)
-    parser.add_argument("--search-low-hz", type=float, default=0.8)
+    parser.add_argument("--search-low-hz", type=float, default=1.0)
     parser.add_argument("--search-high-hz", type=float, default=3.0)
     parser.add_argument("--ppg-low-hz", type=float, default=0.4)
     parser.add_argument("--ppg-high-hz", type=float, default=4.0)
@@ -309,9 +384,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--physio-high-bpm", type=float, default=220.0)
     parser.add_argument("--smooth-windows", type=int, default=5)
     parser.add_argument("--outlier-policy", choices=["interpolate", "previous", "nan"], default="interpolate")
-    parser.add_argument("--plot-records", nargs="+", default=["DATA_01_TYPE01", "DATA_08_TYPE02", "TEST_S01_T01", "TEST_S07_T02"])
+    parser.add_argument(
+        "--plot-records",
+        nargs="+",
+        default=["DATA_01_TYPE01", "DATA_08_TYPE02", "DATA_10_TYPE02", "TEST_S01_T01", "TEST_S07_T02"],
+    )
     return parser.parse_args()
 
+""" Complete Baseline comparison
+For every recording, the script first runs the PPG-only FFT baseline. 
+It then constructs the ACC-NLMS residual signal and applies the same FFT-based HR estimation and 
+five-window trailing moving average. Finally, the results of both methods are aligned, evaluated, exported, and visualised.
+"""
 
 def main() -> None:
     args = parse_args()
@@ -387,7 +471,11 @@ def main() -> None:
                 "desired_std": float(np.std(desired)),
                 "cleaned_std": float(np.std(cleaned)),
                 "artifact_std": float(np.std(artifact)),
+                "cleaned_to_desired_std_ratio": float(np.std(cleaned) / max(np.std(desired), 1e-12)),
                 "artifact_to_desired_std_ratio": float(np.std(artifact) / max(np.std(desired), 1e-12)),
+                "residual_to_desired_power_ratio": float(
+                    np.mean(cleaned**2) / max(float(np.mean(desired**2)), 1e-12)
+                ),
             }
         )
 
@@ -418,8 +506,10 @@ def main() -> None:
                 "search_low_hz": args.search_low_hz,
                 "search_high_hz": args.search_high_hz,
                 "nlms_filter_order": args.nlms_filter_order,
+                "nlms_filter_length_taps": args.nlms_filter_order,
                 "nlms_mu": args.nlms_mu,
                 "smooth_windows": args.smooth_windows,
+                "error_summary_aggregation": "record_equal_as_in_Temko_MATLAB",
             }
         ]
     ).to_csv(config_csv, index=False)
